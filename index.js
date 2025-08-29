@@ -1,6 +1,6 @@
 // index.js — Multi-salas (perfiles desde CLAIM_CONFIG o CLAIM_CONFIG_FILE en ENV)
-// Paneles sin embeds, sin mensajes “abajo”, botón Cancelar, contador (CLAIM_UPDATE_MS).
-// Sala de espera por slot (QUEUE_CAPACITY) + confirmación integrada (CONFIRM_WINDOW_SEC).
+// Paneles sin embeds ni mensajes en el canal, botón Cancelar, contador (CLAIM_UPDATE_MS).
+// Sala de espera por slot (QUEUE_CAPACITY) + confirmación integrada al panel (CONFIRM_WINDOW_SEC).
 
 import {
   Client, GatewayIntentBits, Events,
@@ -80,19 +80,19 @@ function normalizeConfig(cfg) {
 }
 
 /* ---------- estado ---------- */
-const anchors      = new Map();  // `${channelId}:${idx}` -> panelMessageId
-const planByChannel= new Map();  // channelId -> [{title, minutes}, ...]
-const sessions     = new Map();  // panelMessageId -> { ownerId, ... }
-const waitlists    = new Map();  // panelMessageId -> [{ userId, minutes, enqueuedAt }]
-const pendings     = new Map();  // panelMessageId -> { userId, minutes, deadline, timeout, nonce, userTag }
+const anchors       = new Map();  // `${channelId}:${idx}` -> panelMessageId
+const planByChannel = new Map();  // channelId -> [{title, minutes}, ...]
+const sessions      = new Map();  // panelMessageId -> { ownerId, ... }
+const waitlists     = new Map();  // panelMessageId -> [{ userId, minutes, enqueuedAt }]
+const pendings      = new Map();  // panelMessageId -> { userId, minutes, deadline, timeout, nonce, userTag }
 
 const keyFor = (chId, idx) => `${chId}:${idx}`;
 const GAP_BEFORE = `\n\u200B\n\u200B`;
 
 /* ---------- UI ---------- */
 function mmss(ms){ if(ms<0) ms=0; const s=Math.floor(ms/1000), m=Math.floor(s/60), ss=s%60; return `${m<10?'0':''}${m}:${ss<10?'0':''}${ss}`; }
-const openText  = (title, idx) => `${idx===0 ? '' : GAP_BEFORE}**${title}**`;
-const busyText  = (title, ownerTag, minutes, remMs, idx) => `${idx===0 ? '' : GAP_BEFORE}**${title}** · 🔒 **${ownerTag}** · ⏳ **${mmss(remMs)}** (${minutes}m)`;
+const openText    = (title, idx) => `${idx===0 ? '' : GAP_BEFORE}**${title}**`;
+const busyText    = (title, ownerTag, minutes, remMs, idx) => `${idx===0 ? '' : GAP_BEFORE}**${title}** · 🔒 **${ownerTag}** · ⏳ **${mmss(remMs)}** (${minutes}m)`;
 const pendingText = (title, userTag, sec, idx) => `${idx===0 ? '' : GAP_BEFORE}**${title}** · 🟡 pendiente de **${userTag}** · confirma en ${sec}s`;
 
 function rowFor(idx, minutes, enableDur, enableCancel) {
@@ -128,12 +128,20 @@ async function renderBusy(msg, sess) {
   const rem = sess.endAt - Date.now();
   const text = busyText(sess.title, sess.ownerTag, sess.minutesSel, rem, sess.slotIndex);
   if (text !== sess.lastText) {
-    await msg.edit({ content: text, components: [rowFor(sess.slotIndex, sess.minutes, false, true)] });
+    // Mantener HABILITADOS los botones de minutos para poder entrar a la cola.
+    await msg.edit({
+      content: text,
+      components: [rowFor(sess.slotIndex, sess.minutes, true, true)]
+    });
     sess.lastText = text;
   }
 }
-async function renderPending(msg, idx, title, userTag, sec, panelId, nonce) {
-  await msg.edit({ content: pendingText(title, userTag, sec, idx), components: [rowPending(idx, panelId, nonce)] });
+async function renderPending(msg, idx, title, userTag, sec, panelId, nonce, minutes) {
+  // Fila 1: Confirmar/Rechazar del pendiente; Fila 2: minutos activos para que otros entren a la cola.
+  await msg.edit({
+    content: pendingText(title, userTag, sec, idx),
+    components: [rowPending(idx, panelId, nonce), rowFor(idx, minutes, true, false)]
+  });
 }
 
 /* ---------- helpers de cola ---------- */
@@ -185,8 +193,7 @@ async function createPanelsForChannel(ch, slots){
 
   // limpiar estados del canal
   for (const [panelId, sess] of sessions) if (sess.chId === ch.id) sessions.delete(panelId);
-  for (const [panelId, q] of waitlists) {
-    // si el mensaje no existe o pertenece al mismo canal, limpiamos
+  for (const [panelId] of waitlists) {
     const ok = await ch.messages.fetch(panelId).then(()=>true).catch(()=>false);
     if (!ok) waitlists.delete(panelId);
   }
@@ -194,7 +201,6 @@ async function createPanelsForChannel(ch, slots){
     const ok = await ch.messages.fetch(panelId).then(()=>true).catch(()=>false);
     if (!ok) { if (p.timeout) clearTimeout(p.timeout); pendings.delete(panelId); }
   }
-  // borrar anclas previas del canal
   for (let i=0;i<slots.length+10;i++) anchors.delete(keyFor(ch.id, i));
 
   // crear anclas nuevas
@@ -225,7 +231,7 @@ async function promoteNext(panelMsg, slot, idx){
   let userTag = `ID:${next.userId}`;
   try { const u = await client.users.fetch(next.userId); if (u?.tag) userTag = u.tag; } catch {}
 
-  await renderPending(panelMsg, idx, slot.title, userTag, sec, panelId, nonce);
+  await renderPending(panelMsg, idx, slot.title, userTag, sec, panelId, nonce, slot.minutes);
 
   const timeout = setTimeout(async ()=>{
     const p = pendings.get(panelId);
