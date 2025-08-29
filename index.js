@@ -1,6 +1,6 @@
 // index.js — Multi-salas (perfiles desde CLAIM_CONFIG o CLAIM_CONFIG_FILE en ENV)
-// Paneles sin embeds ni mensajes en el canal, botón Cancelar, contador (CLAIM_UPDATE_MS).
-// Sala de espera por slot (QUEUE_CAPACITY) + confirmación integrada al panel (CONFIRM_WINDOW_SEC).
+// Paneles sin mensajes en el canal, botón Cancelar, contador (CLAIM_UPDATE_MS).
+// Sala de espera por slot (QUEUE_CAPACITY) + confirmación integrada (CONFIRM_WINDOW_SEC) + vista de cola.
 
 import {
   Client, GatewayIntentBits, Events,
@@ -83,7 +83,7 @@ function normalizeConfig(cfg) {
 const anchors       = new Map();  // `${channelId}:${idx}` -> panelMessageId
 const planByChannel = new Map();  // channelId -> [{title, minutes}, ...]
 const sessions      = new Map();  // panelMessageId -> { ownerId, ... }
-const waitlists     = new Map();  // panelMessageId -> [{ userId, minutes, enqueuedAt }]
+const waitlists     = new Map();  // panelMessageId -> [{ userId, minutes, enqueuedAt, tag }]
 const pendings      = new Map();  // panelMessageId -> { userId, minutes, deadline, timeout, nonce, userTag }
 
 const keyFor = (chId, idx) => `${chId}:${idx}`;
@@ -121,33 +121,54 @@ function rowPending(idx, panelId, nonce) {
     new ButtonBuilder().setCustomId(`s${idx}_no_${panelId}_${nonce}`).setLabel('Rechazar').setStyle(ButtonStyle.Danger)
   );
 }
+
+// --- Vista de cola (sin ping, muestra hasta 3) ---
+function queueLine(panelId){
+  const q = getQueue(panelId);
+  if (!q.length) return '';
+  const names = q.slice(0,3).map(e => `**${e.tag || ('ID:'+e.userId)}** ${e.minutes}m`).join(' · ');
+  const more  = q.length > 3 ? `  +${q.length-3} más` : '';
+  return `\n*📝 Cola:* ${names}${more}`;
+}
+
 async function renderOpen(msg, idx, title, minutes) {
-  await msg.edit({ content: openText(title, idx), components: [rowFor(idx, minutes, true, false)] });
+  const content = openText(title, idx) + queueLine(msg.id);
+  await msg.edit({ content, components: [rowFor(idx, minutes, true, false)] });
 }
 async function renderBusy(msg, sess) {
   const rem = sess.endAt - Date.now();
-  const text = busyText(sess.title, sess.ownerTag, sess.minutesSel, rem, sess.slotIndex);
-  if (text !== sess.lastText) {
-    // Mantener HABILITADOS los botones de minutos para poder entrar a la cola.
-    await msg.edit({
-      content: text,
-      components: [rowFor(sess.slotIndex, sess.minutes, true, true)]
-    });
-    sess.lastText = text;
+  const content = busyText(sess.title, sess.ownerTag, sess.minutesSel, rem, sess.slotIndex) + queueLine(msg.id);
+  if (content !== sess.lastText) {
+    // Minutos habilitados para permitir unirse a la cola; Cancelar habilitado para dueño o quien esté en cola.
+    await msg.edit({ content, components: [rowFor(sess.slotIndex, sess.minutes, true, true)] });
+    sess.lastText = content;
   }
 }
 async function renderPending(msg, idx, title, userTag, sec, panelId, nonce, minutes) {
-  // Fila 1: Confirmar/Rechazar del pendiente; Fila 2: minutos activos para que otros entren a la cola.
-  await msg.edit({
-    content: pendingText(title, userTag, sec, idx),
-    components: [rowPending(idx, panelId, nonce), rowFor(idx, minutes, true, false)]
-  });
+  const content = pendingText(title, userTag, sec, idx) + queueLine(msg.id);
+  // Fila 1: Confirmar/Rechazar; Fila 2: minutos (cola) + Cancelar activo para permitir salir de cola/pending
+  await msg.edit({ content, components: [rowPending(idx, panelId, nonce), rowFor(idx, minutes, true, true)] });
 }
 
 /* ---------- helpers de cola ---------- */
 function getQueue(panelId){ if (!waitlists.has(panelId)) waitlists.set(panelId, []); return waitlists.get(panelId); }
 function inQueue(queue, userId){ return queue.findIndex(q => q.userId === userId); }
 function clearPending(panelId) { const p = pendings.get(panelId); if (p?.timeout) clearTimeout(p.timeout); pendings.delete(panelId); }
+
+// refrescar el panel según estado actual
+async function refreshPanel(panelMsg, idx, slot){
+  const panelId = panelMsg.id;
+  const sess = sessions.get(panelId);
+  const pend = pendings.get(panelId);
+  if (sess) {
+    await renderBusy(panelMsg, sess);
+  } else if (pend) {
+    const secLeft = Math.max(0, Math.ceil((pend.deadline - Date.now())/1000));
+    await renderPending(panelMsg, idx, slot.title, pend.userTag, secLeft, panelId, pend.nonce, slot.minutes);
+  } else {
+    await renderOpen(panelMsg, idx, slot.title, slot.minutes);
+  }
+}
 
 /* ---------- limpieza ---------- */
 async function purgeChannel(ch){
@@ -211,7 +232,7 @@ async function createPanelsForChannel(ch, slots){
   }
 }
 
-/* ---------- promoción / confirmación (integrada al panel, sin mensajes) ---------- */
+/* ---------- promoción / confirmación (integrada al panel) ---------- */
 async function promoteNext(panelMsg, slot, idx){
   const panelId = panelMsg.id;
   const queue = getQueue(panelId);
@@ -227,17 +248,14 @@ async function promoteNext(panelMsg, slot, idx){
   const nonce = Math.random().toString(36).slice(2,10) + Date.now().toString(36);
   const sec   = CONFIRM_WINDOW_SEC;
 
-  // Mostrar tag (sin ping)
-  let userTag = `ID:${next.userId}`;
-  try { const u = await client.users.fetch(next.userId); if (u?.tag) userTag = u.tag; } catch {}
-
+  let userTag = next.tag || `ID:${next.userId}`;
   await renderPending(panelMsg, idx, slot.title, userTag, sec, panelId, nonce, slot.minutes);
 
   const timeout = setTimeout(async ()=>{
     const p = pendings.get(panelId);
     if (!p || p.nonce !== nonce) return;
     clearPending(panelId);
-    await promoteNext(panelMsg, slot, idx); // siguiente o queda abierto
+    await promoteNext(panelMsg, slot, idx);
   }, sec * 1000);
 
   pendings.set(panelId, {
@@ -257,7 +275,6 @@ client.once(Events.ClientReady, async (c)=>{
     const channels = await resolveChannels(g, cfg);
     for (const { ch, slots } of channels) await createPanelsForChannel(ch, slots);
   }
-  // watchdog (agrega paneles nuevos si aparecen en config)
   setInterval(async ()=>{
     const cfg2 = await loadConfig();
     for (const [,g] of c.guilds.cache) {
@@ -302,7 +319,6 @@ client.on(Events.InteractionCreate, async i=>{
       const panelId = m[3];
       const nonce = m[4];
 
-      // el click debe ser en el mismo panel
       if (i.message.id !== panelId) { try { await i.deferUpdate(); } catch {} return; }
 
       const pending = pendings.get(panelId);
@@ -396,6 +412,7 @@ client.on(Events.InteractionCreate, async i=>{
     // cancelar posición en cola
     if (pos !== -1) {
       queue.splice(pos, 1);
+      await refreshPanel(panelMsg, idx, slot);
       try { await i.reply({ ephemeral: true, content: '✅ Saliste de la sala de espera.' }); } catch {}
       return;
     }
@@ -448,9 +465,19 @@ client.on(Events.InteractionCreate, async i=>{
     try { await i.reply({ ephemeral: true, content: `⛔ La sala de espera está llena (capacidad ${QUEUE_CAPACITY}).` }); } catch {}
     return;
   }
-  queue.push({ userId: i.user.id, minutes: minutesSel, enqueuedAt: Date.now() });
+  queue.push({ userId: i.user.id, minutes: minutesSel, enqueuedAt: Date.now(), tag: i.user.tag });
+  await refreshPanel(panelMsg, idx, slot);
   try { await i.reply({ ephemeral: true, content: `🕒 Entraste en la sala de espera. Posición: **${queue.length}**.` }); } catch {}
 });
+
+/* ---------- manejo de señales (limpio) ---------- */
+function shutdown(signal) {
+  console.log(`🛑 Recibí ${signal}, cerrando...`);
+  try { client.destroy(); } catch {}
+  process.exit(0);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
 
 /* ---------- login (ENV en Koyeb) ---------- */
 const token = process.env.TOKEN || process.env.DISCORD_TOKEN;
