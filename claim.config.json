@@ -10,7 +10,7 @@
     },
 	 "cuadrado": {
       "slots": [
-        { "title": "ALE 4", "minutes": [30, 60, 90] },
+        { "title": "PRACA 4", "minutes": [30, 60, 90] },
         { "title": "PRACA 5", "minutes": [30, 60, 90] },
         { "title": "PRACA 6", "minutes": [30, 60, 90] },
         { "title": "PRACA 7", "minutes": [30, 60, 90] }
