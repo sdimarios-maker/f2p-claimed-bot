@@ -1,7 +1,8 @@
-// index.js — Multi-salas con DMs y cooldown por cancelación
+// index.js — Multi-salas con DMs, cooldown por cancelación y bloqueo global de multi-claim
 // - Botones siempre en el panel del canal (sin mensajes en canal)
 // - DMs con link "Ver panel" y "Salir de la cola"
-// - Cooldown 2h (configurable) por slot cuando el dueño cancela su tiempo
+// - Cooldown configurable por cancelación (CANCEL_COOLDOWN_SEC o _MIN)
+// - BLOQUEO GLOBAL: un usuario no puede estar activo/pendiente/en cola en más de un slot a la vez
 
 import {
   Client, GatewayIntentBits, Events,
@@ -15,6 +16,7 @@ import path from 'node:path';
 const UPDATE_STEP_MS       = Math.max(1000, parseInt(process.env.CLAIM_UPDATE_MS || '30000', 10));
 const QUEUE_CAPACITY       = Math.max(0,   parseInt(process.env.QUEUE_CAPACITY || '2', 10));
 const CONFIRM_WINDOW_SEC   = Math.max(5,   parseInt(process.env.CONFIRM_WINDOW_SEC || '45', 10));
+// Prioridad: segundos > minutos
 const COOLDOWN_MS = (() => {
   const sec = parseInt(process.env.CANCEL_COOLDOWN_SEC || '0', 10);
   if (sec > 0) return sec * 1000;
@@ -54,9 +56,12 @@ async function dmUser(userId, payload) {
 /* ---------- helpers tiempo ---------- */
 function mmss(ms){ if(ms<0) ms=0; const s=Math.floor(ms/1000), m=Math.floor(s/60), ss=s%60; return `${m<10?'0':''}${m}:${ss<10?'0':''}${ss}`; }
 function fmtRemain(ms){
-  if (ms < 0) ms = 0;
-  const m = Math.ceil(ms/60000);
-  const h = Math.floor(m/60), mm = m%60;
+  if (ms <= 0) return '0s';
+  const s = Math.ceil(ms/1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s/60);
+  const h = Math.floor(m/60);
+  const mm = m % 60;
   return h ? `${h}h ${mm}m` : `${m}m`;
 }
 
@@ -122,11 +127,50 @@ function applyCooldown(chId, idx, userId){
   if (COOLDOWN_MS <= 0) return;
   cooldowns.set(coolKey(chId, idx, userId), Date.now() + COOLDOWN_MS);
 }
-
 function hasCooldown(chId, idx, userId){
   const until = cooldowns.get(coolKey(chId, idx, userId)) || 0;
   const rem = until - Date.now();
   return [rem > 0, rem];
+}
+
+/* ---------- helpers de panel / bloqueo global ---------- */
+// inverso de anchors: panelId -> { chId, idx }
+function reverseAnchor(panelId){
+  for (const [k, v] of anchors) {
+    if (v === panelId) {
+      const [chId, idxStr] = k.split(':');
+      return { chId, idx: parseInt(idxStr, 10) };
+    }
+  }
+  return null;
+}
+function slotTitleBy(chId, idx){
+  const plan = planByChannel.get(chId);
+  return plan?.[idx]?.title || 'Slot';
+}
+async function describePanel(panelId){
+  const ref = reverseAnchor(panelId);
+  if (!ref) return { text: 'otro slot', url: null };
+  const title = slotTitleBy(ref.chId, ref.idx);
+  let ch = client.channels.cache.get(ref.chId);
+  if (!ch) ch = await client.channels.fetch(ref.chId).catch(()=>null);
+  const guildId = ch?.guildId;
+  const url = guildId ? jumpLink(guildId, ref.chId, panelId) : null;
+  return { text: `**${title}** en <#${ref.chId}>`, url };
+}
+// Busca si el usuario participa en ALGÚN otro panel (activo/pendiente/cola)
+function findGlobalConflict(userId, exceptPanelId = null){
+  for (const [pid, sess] of sessions) {
+    if (pid !== exceptPanelId && sess.ownerId === userId) return { type: 'activo', panelId: pid };
+  }
+  for (const [pid, p] of pendings) {
+    if (pid !== exceptPanelId && p.userId === userId) return { type: 'pendiente', panelId: pid };
+  }
+  for (const [pid, q] of waitlists) {
+    if (pid === exceptPanelId) continue;
+    if (q.some(e => e.userId === userId)) return { type: 'cola', panelId: pid };
+  }
+  return null;
 }
 
 /* ---------- UI ---------- */
@@ -134,6 +178,15 @@ const GAP_BEFORE = `\n\u200B\n\u200B`;
 const openText    = (title, idx) => `${idx===0 ? '' : GAP_BEFORE}**${title}**`;
 const busyText    = (title, ownerTag, minutes, remMs, idx) => `${idx===0 ? '' : GAP_BEFORE}**${title}** · 🔒 **${ownerTag}** · ⏳ **${mmss(remMs)}** (${minutes}m)`;
 const pendingText = (title, userTag, sec, idx) => `${idx===0 ? '' : GAP_BEFORE}**${title}** · 🟡 pendiente de **${userTag}** · confirma en ${sec}s`;
+
+// vista cola (muestra hasta 3)
+function queueLine(panelId){
+  const q = getQueue(panelId);
+  if (!q.length) return '';
+  const names = q.slice(0,3).map(e => `**${e.tag || ('ID:'+e.userId)}** ${e.minutes}m`).join(' · ');
+  const more  = q.length > 3 ? `  +${q.length-3} más` : '';
+  return `\n*📝 Cola:* ${names}${more}`;
+}
 
 function rowFor(idx, minutes, enableDur, enableCancel) {
   const row = new ActionRowBuilder();
@@ -166,15 +219,6 @@ function dmQueueRow(panelMsg){
     new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('Ver panel').setURL(jumpLink(panelMsg.guildId, panelMsg.channelId, panelMsg.id)),
     new ButtonBuilder().setStyle(ButtonStyle.Danger).setLabel('Salir de la cola').setCustomId(`dm_cancel_${panelMsg.id}`)
   );
-}
-
-// vista cola (muestra hasta 3)
-function queueLine(panelId){
-  const q = getQueue(panelId);
-  if (!q.length) return '';
-  const names = q.slice(0,3).map(e => `**${e.tag || ('ID:'+e.userId)}** ${e.minutes}m`).join(' · ');
-  const more  = q.length > 3 ? `  +${q.length-3} más` : '';
-  return `\n*📝 Cola:* ${names}${more}`;
 }
 
 async function renderOpen(msg, idx, title, minutes) {
@@ -279,13 +323,25 @@ async function promoteNext(panelMsg, slot, idx){
   while (queue.length > 0) {
     const next = queue.shift();
 
-    // si está en cooldown, avisar y pasar al siguiente
+    // Cooldown por cancelación
     const [inCd, rem] = hasCooldown(panelMsg.channel.id, idx, next.userId);
     if (inCd) {
       await dmUser(next.userId, {
         content:
           `⛔ Estás en cooldown en ${whereStr(panelMsg, slot.title)}.\n` +
           `Te quedan **${fmtRemain(rem)}**. Te saltamos en la cola.`
+      });
+      continue;
+    }
+
+    // BLOQUEO GLOBAL: si ya participa en otro slot (activo/pendiente/cola), saltar
+    const conflict = findGlobalConflict(next.userId, panelId);
+    if (conflict) {
+      const d = await describePanel(conflict.panelId);
+      await dmUser(next.userId, {
+        content:
+          `⛔ No podés tomar otra sala mientras estás **${conflict.type}** en ${d.text}` +
+          (d.url ? `.\nPanel: ${d.url}` : '.')
       });
       continue;
     }
@@ -422,7 +478,17 @@ client.on(Events.InteractionCreate, async i=>{
       const slot = plan[idx];
 
       if (kind === 'ok') {
-        // safety: si justo entró cooldown (no debería), abortar
+        // BLOQUEO GLOBAL antes de activar
+        const conflict = findGlobalConflict(i.user.id, panelId);
+        if (conflict) {
+          clearPending(panelId);
+          await promoteNext(panelMsg, slot, idx);
+          const d = await describePanel(conflict.panelId);
+          await dmOnly(i, `⛔ No podés confirmar porque estás **${conflict.type}** en ${d.text}` + (d.url ? `.\nPanel: ${d.url}` : '.'));
+          return;
+        }
+
+        // safety: cooldown por si acaso
         const [inCd, rem] = hasCooldown(panelMsg.channel.id, idx, i.user.id);
         if (inCd) {
           clearPending(panelId);
@@ -430,6 +496,7 @@ client.on(Events.InteractionCreate, async i=>{
           await dmOnly(i, `⛔ Estás en cooldown en ${whereStr(panelMsg, slot.title)}. Te quedan **${fmtRemain(rem)}**.`);
           return;
         }
+
         clearPending(panelId);
         const minutesSel = pending.minutes;
         const sess = {
@@ -497,7 +564,7 @@ client.on(Events.InteractionCreate, async i=>{
       await dmOnly(i, `🛑 Cancelaste tu tiempo en ${whereStr(panelMsg, slot.title)}.\nQuedás en **cooldown ${COOLDOWN_LABEL}** para este slot.`);
       return;
     }
-    // cancelar pendiente (NO aplica cooldown por pedido)
+    // cancelar pendiente (NO aplica cooldown)
     if (pending && pending.userId === i.user.id) {
       clearPending(panelId);
       await promoteNext(panelMsg, slot, idx);
@@ -515,11 +582,23 @@ client.on(Events.InteractionCreate, async i=>{
     return;
   }
 
-  // iniciar / unirse a cola (chequear COOLDOWN ANTES)
+  // iniciar / unirse a cola (chequear COOLDOWN y BLOQUEO GLOBAL)
   const minutesSel = parseInt(mm[2], 10);
   const minutesList = slot.minutes;
   if (!minutesList.includes(minutesSel)) { try { await i.deferUpdate(); } catch{} return; }
 
+  // Bloqueo global: ¿ya participa en otro panel?
+  const conflict = findGlobalConflict(i.user.id, panelId);
+  if (conflict) {
+    const d = await describePanel(conflict.panelId);
+    await dmOnly(i,
+      `⛔ No podés tomar otra sala: estás **${conflict.type}** en ${d.text}` +
+      (d.url ? `.\nPanel: ${d.url}` : '.')
+    );
+    return;
+  }
+
+  // Cooldown por cancelación (del mismo slot)
   const [inCd, rem] = hasCooldown(ch.id, idx, i.user.id);
   if (inCd) {
     await dmOnly(i, `⛔ Tenés cooldown en ${whereStr(panelMsg, slot.title)}. Te quedan **${fmtRemain(rem)}**.\nPanel: ${jumpLink(panelMsg.guildId, panelMsg.channelId, panelMsg.id)}`);
