@@ -645,6 +645,7 @@ client.on(Events.InteractionCreate, async i=>{
       timer: null, lastText: ''
     };
     sessions.set(panelId, sess);
+	
 
     const render = async () => { await renderBusy(panelMsg, sess).catch(()=>{}); };
     await render();
