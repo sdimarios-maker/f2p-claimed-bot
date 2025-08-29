@@ -1,10 +1,9 @@
-// index.js — Multi-salas con DMs, cooldown, bloqueo global y ALERTAS (texto + sonido opcional)
+// index.js — Multi-salas con DMs, cooldown por cancelación y bloqueo global de multi-claim
 // - Botones siempre en el panel del canal (sin mensajes en canal)
 // - DMs con link "Ver panel" y "Salir de la cola"
-// - Cooldown configurable (CANCEL_COOLDOWN_SEC o _MIN)
-// - BLOQUEO GLOBAL: nadie puede estar activo/pendiente/en cola en más de un slot a la vez
-// - Fix timers: al cancelar o recrear panel no sale “tu tiempo terminó”
-// - Alertas: canal de texto + sonido en canal de voz (si se configuran las ENV)
+// - Cooldown configurable por cancelación (CANCEL_COOLDOWN_SEC o _MIN)
+// - BLOQUEO GLOBAL: un usuario no puede estar activo/pendiente/en cola en más de un slot a la vez
+// - Fix: al cancelar o recrear panel, no envía el DM de “tu tiempo terminó” (limpia interval/timeout)
 
 import {
   Client, GatewayIntentBits, Events,
@@ -13,15 +12,6 @@ import {
 } from 'discord.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-
-// ===== Audio para alertas (opcional) =====
-import {
-  joinVoiceChannel,
-  createAudioPlayer,
-  createAudioResource,
-  NoSubscriberBehavior,
-  AudioPlayerStatus
-} from '@discordjs/voice';
 
 /* ---------- ajustes por ENV (Koyeb) ---------- */
 const UPDATE_STEP_MS       = Math.max(1000, parseInt(process.env.CLAIM_UPDATE_MS || '30000', 10));
@@ -38,13 +28,6 @@ const COOLDOWN_LABEL = COOLDOWN_MS >= 60000
   ? `${Math.round(COOLDOWN_MS/60000)}m`
   : `${Math.round(COOLDOWN_MS/1000)}s`;
 
-// Alertas (texto/sonido)
-const ALERT_TEXT_CHANNEL_ID  = process.env.ALERT_TEXT_CHANNEL_ID || process.env.NOTIFY_CHANNEL_ID || '';
-const ALERT_EVENTS = (process.env.ALERT_EVENTS || 'FREE,INVITE,START,END,CANCEL')
-  .split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
-const ALERT_VOICE_CHANNEL_ID = process.env.ALERT_VOICE_CHANNEL_ID || '';
-const ALERT_SOUND_FILE       = process.env.ALERT_SOUND_FILE || '';
-
 const TWO_WEEKS = 14 * 24 * 60 * 60 * 1000;
 const PURGE_LOOP_MAX = 50;
 const sleep = (ms) => new Promise(r => setTimeout(r, 350));
@@ -54,7 +37,6 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
 console.log(`⚙️ Cooldown: ${COOLDOWN_LABEL} (${COOLDOWN_MS}ms) usando ${process.env.CANCEL_COOLDOWN_SEC ? 'SEC' : 'MIN'}`);
-console.log(`🔔 Alertas → texto:${ALERT_TEXT_CHANNEL_ID? 'ON':'OFF'} voz:${(ALERT_VOICE_CHANNEL_ID && ALERT_SOUND_FILE)? 'ON':'OFF'} eventos:[${ALERT_EVENTS.join(', ')}]`);
 
 /* ---------- util DMs ---------- */
 const jumpLink = (guildId, channelId, messageId) =>
@@ -83,56 +65,6 @@ function fmtRemain(ms){
   const h = Math.floor(m/60);
   const mm = m % 60;
   return h ? `${h}h ${mm}m` : `${m}m`;
-}
-
-/* ---------- alertas: texto + sonido ---------- */
-function want(kind){ return ALERT_EVENTS.includes(kind.toUpperCase()); }
-
-async function postTextAlert(kind, panelMsg, title, lines = []) {
-  if (!ALERT_TEXT_CHANNEL_ID || !want(kind)) return;
-  try {
-    const ch = await client.channels.fetch(ALERT_TEXT_CHANNEL_ID).catch(()=>null);
-    if (!ch || ch.type !== ChannelType.GuildText) return;
-    const url = jumpLink(panelMsg.guildId, panelMsg.channelId, panelMsg.id);
-    const where = `**${title}** en <#${panelMsg.channelId}>`;
-    const body = lines.length ? `\n${lines.join('\n')}` : '';
-    await ch.send({ content: `🔔 **${kind}** — ${where}\n${url}${body}` });
-  } catch {}
-}
-
-async function playAlertSound() {
-  if (!ALERT_VOICE_CHANNEL_ID || !ALERT_SOUND_FILE) return;
-  try {
-    const ch = await client.channels.fetch(ALERT_VOICE_CHANNEL_ID).catch(()=>null);
-    if (!ch || ch.type !== ChannelType.GuildVoice) return;
-
-    const connection = joinVoiceChannel({
-      channelId: ch.id,
-      guildId: ch.guild.id,
-      adapterCreator: ch.guild.voiceAdapterCreator
-    });
-
-    const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Stop } });
-    const resource = createAudioResource(path.resolve(process.cwd(), ALERT_SOUND_FILE));
-
-    const done = new Promise(res => {
-      const finish = () => res();
-      player.once(AudioPlayerStatus.Idle, finish);
-      setTimeout(finish, 7000); // safety timeout
-    });
-
-    connection.subscribe(player);
-    player.play(resource);
-    await done;
-
-    try { player.stop(); } catch {}
-    try { connection.destroy(); } catch {}
-  } catch {}
-}
-
-async function alert(kind, panelMsg, title, lines = []) {
-  await postTextAlert(kind, panelMsg, title, lines);
-  if (want(kind)) await playAlertSound();
 }
 
 /* ---------- config ---------- */
@@ -204,6 +136,7 @@ function hasCooldown(chId, idx, userId){
 }
 
 /* ---------- helpers de panel / bloqueo global ---------- */
+// inverso de anchors: panelId -> { chId, idx }
 function reverseAnchor(panelId){
   for (const [k, v] of anchors) {
     if (v === panelId) {
@@ -248,6 +181,7 @@ const openText    = (title, idx) => `${idx===0 ? '' : GAP_BEFORE}**${title}**`;
 const busyText    = (title, ownerTag, minutes, remMs, idx) => `${idx===0 ? '' : GAP_BEFORE}**${title}** · 🔒 **${ownerTag}** · ⏳ **${mmss(remMs)}** (${minutes}m)`;
 const pendingText = (title, userTag, sec, idx) => `${idx===0 ? '' : GAP_BEFORE}**${title}** · 🟡 pendiente de **${userTag}** · confirma en ${sec}s`;
 
+// vista cola (muestra hasta 3)
 function queueLine(panelId){
   const q = getQueue(panelId);
   if (!q.length) return '';
@@ -416,7 +350,6 @@ async function promoteNext(panelMsg, slot, idx){
           `⛔ Estás en cooldown en ${whereStr(panelMsg, slot.title)}.\n` +
           `Te quedan **${fmtRemain(rem)}**. Te saltamos en la cola.`
       });
-      await alert('SKIP', panelMsg, slot.title, [`Salteado: <@${next.userId}> (cooldown ${fmtRemain(rem)}).`]);
       continue;
     }
 
@@ -429,7 +362,6 @@ async function promoteNext(panelMsg, slot, idx){
           `⛔ No podés tomar otra sala mientras estás **${conflict.type}** en ${d.text}` +
           (d.url ? `.\nPanel: ${d.url}` : '.')
       });
-      await alert('SKIP', panelMsg, slot.title, [`Salteado: <@${next.userId}> (ocupado en otro slot).`]);
       continue;
     }
 
@@ -447,8 +379,6 @@ async function promoteNext(panelMsg, slot, idx){
       components: [dmQueueRow(panelMsg)]
     });
 
-    await alert('INVITE', panelMsg, slot.title, [`Invitado: <@${next.userId}> por **${next.minutes}m**.`]);
-
     const timeout = setTimeout(async ()=>{
       const p = pendings.get(panelId);
       if (!p || p.nonce !== nonce) return;
@@ -464,7 +394,6 @@ async function promoteNext(panelMsg, slot, idx){
   }
 
   await renderOpen(panelMsg, idx, slot.title, slot.minutes).catch(()=>{});
-  await alert('FREE', panelMsg, slot.title, ['Quedó libre.']);
 }
 
 /* ---------- ready ---------- */
@@ -609,10 +538,8 @@ client.on(Events.InteractionCreate, async i=>{
           stopSessionById(panelId);
           await promoteNext(panelMsg, slot, idx);
           await dmUser(i.user.id, { content: `⏱️ Tu tiempo en ${whereStr(panelMsg, slot.title)} terminó.` });
-          await alert('END', panelMsg, slot.title, [`Terminó: <@${i.user.id}>.`]);
         }, minutesSel * 60 * 1000);
 
-        await alert('START', panelMsg, slot.title, [`Usuario: <@${i.user.id}> — **${minutesSel}m**.`]);
         await dmOnly(i, `✅ Confirmado: **${minutesSel}m** en ${whereStr(panelMsg, slot.title)}.\nPanel: ${jumpLink(panelMsg.guildId, panelMsg.channelId, panelMsg.id)}`);
       } else {
         clearPending(panelId);
@@ -649,12 +576,11 @@ client.on(Events.InteractionCreate, async i=>{
     const pos = inQueue(queue, i.user.id);
     const pending = pendings.get(panelId);
 
-    // cancelar activo (APLICA COOLDOWN + limpia timers)
+    // cancelar activo (APLICA COOLDOWN + limpia interval/timeout)
     if (sess && i.user.id === sess.ownerId) {
       stopSessionById(panelId);
       await promoteNext(panelMsg, slot, idx);
       applyCooldown(ch.id, idx, i.user.id);
-      await alert('CANCEL', panelMsg, slot.title, [`Canceló: <@${i.user.id}>. Cooldown: ${COOLDOWN_LABEL}.`]);
       await dmOnly(i, `🛑 Cancelaste tu tiempo en ${whereStr(panelMsg, slot.title)}.\nQuedás en **cooldown ${COOLDOWN_LABEL}** para este slot.`);
       return;
     }
@@ -722,16 +648,14 @@ client.on(Events.InteractionCreate, async i=>{
 
     const render = async () => { await renderBusy(panelMsg, sess).catch(()=>{}); };
     await render();
-
     sess.timer = setInterval(()=>render().catch(()=>{}), UPDATE_STEP_MS);
+
     sess.endTO = setTimeout(async ()=>{
       stopSessionById(panelId);
       await promoteNext(panelMsg, slot, idx);
       await dmUser(i.user.id, { content: `⏱️ Tu tiempo en ${whereStr(panelMsg, slot.title)} terminó.` });
-      await alert('END', panelMsg, slot.title, [`Terminó: <@${i.user.id}>.`]);
     }, minutesSel*60*1000);
 
-    await alert('START', panelMsg, slot.title, [`Usuario: <@${i.user.id}> — **${minutesSel}m**.`]);
     await dmOnly(i, `✅ Empezaste **${minutesSel}m** en ${whereStr(panelMsg, slot.title)}.\nPanel: ${jumpLink(panelMsg.guildId, panelMsg.channelId, panelMsg.id)}`);
     return;
   }
