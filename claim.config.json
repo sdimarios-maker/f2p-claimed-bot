@@ -1,0 +1,24 @@
+{
+  "profiles": {
+    "pico": {
+      "slots": [
+        { "title": "PICO 4", "minutes": [30, 60, 90] },
+        { "title": "PICO 5", "minutes": [30, 60, 90] },
+        { "title": "PICO 6", "minutes": [30, 60, 90] },
+        { "title": "PICO 7", "minutes": [30, 60, 90] }
+      ]
+    },
+    "agresivos": {
+      "slots": [
+        { "title": "NORTE",     "minutes": [30, 60, 90] },
+        { "title": "DERECHA",   "minutes": [30, 60, 90] },
+        { "title": "IZQUIERDA", "minutes": [30, 60, 90] },
+        { "title": "SUR",       "minutes": [30, 60, 90] }
+      ]
+    }
+  },
+  "channels": [
+    { "names": ["antidemons", "oro", "pedras", "boss-rotation"], "profile": "pico" },
+    { "names": ["agresivos-p4", "agresivos-p5", "agresivos-p6", "agresivos-p7"], "profile": "agresivos" }
+  ]
+}
