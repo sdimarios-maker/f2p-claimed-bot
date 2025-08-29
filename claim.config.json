@@ -34,7 +34,7 @@
 
     { "names": ["antidemons-p6", "antidemons-p7", "antidemons-p8", "antidemons-p9"], "profile": "dosbot" },
     { "names": ["oro-p6",        "oro-p7",        "oro-p8",        "oro-p9"],        "profile": "dosbot" },
-	{ "names": ["xp-p6",         "xp-p7",         "xp-p8",         "xp-p9"],         "profile": "dosbot" },
+	{ "names": ["xp1-p6", "xp2-p6","xp3-p6", "xp1-p7","xp2-p7","xp3-p7","xp1-p8","xp2-p8","xp3-p8","xp1-p9","xp2-p9","xp3-p9"],         "profile": "dosbot" },
     { "names": ["piedra-p6",     "piedra-p7",     "piedra-p8",     "piedra-p9"],     "profile": "dosbot" }
   ]
 }
