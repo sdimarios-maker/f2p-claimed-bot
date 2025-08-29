@@ -8,6 +8,14 @@
         { "title": "PICO 7", "minutes": [30, 60, 90] }
       ]
     },
+	 "cuadrado": {
+      "slots": [
+        { "title": "PRACA 4", "minutes": [30, 60, 90] },
+        { "title": "PRACA 5", "minutes": [30, 60, 90] },
+        { "title": "PRACA 6", "minutes": [30, 60, 90] },
+        { "title": "PRACA 7", "minutes": [30, 60, 90] }
+      ]
+    },
     "agresivos": {
       "slots": [
         { "title": "NORTE",     "minutes": [30, 60, 90] },
@@ -18,7 +26,8 @@
     }
   },
   "channels": [
-    { "names": ["antidemons", "oro", "pedras", "boss-rotation"], "profile": "pico" },
+    { "names": ["boss-rotation"], "profile": "pico" },
+	 { "names": ["antidemons", "oro", "pedras"], "profile": "cuadrado" },
     { "names": ["agresivos-p4", "agresivos-p5", "agresivos-p6", "agresivos-p7"], "profile": "agresivos" }
   ]
 }
