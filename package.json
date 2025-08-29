@@ -4,12 +4,8 @@
   "private": true,
   "type": "module",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "engines": {
-    "node": ">=20"
-  },
+  "scripts": { "start": "node index.js" },
+  "engines": { "node": ">=20" },
   "dependencies": {
     "discord.js": "^14.15.3",
     "@discordjs/voice": "^0.16.1",
