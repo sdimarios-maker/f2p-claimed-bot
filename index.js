@@ -1,6 +1,7 @@
 // index.js — Multi-salas (perfiles desde CLAIM_CONFIG o CLAIM_CONFIG_FILE en ENV)
-// Paneles sin mensajes en el canal, botón Cancelar, contador (CLAIM_UPDATE_MS).
+// Sin mensajes en el canal (todo por DM), botón Cancelar, contador (CLAIM_UPDATE_MS).
 // Sala de espera por slot (QUEUE_CAPACITY) + confirmación integrada (CONFIRM_WINDOW_SEC) + vista de cola.
+// DMs con botones: "Ver panel" (link) y "Salir de la cola" (desde DM).
 
 import {
   Client, GatewayIntentBits, Events,
@@ -23,6 +24,27 @@ const sleep = (ms) => new Promise(r => setTimeout(r, 350));
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
+
+/* ---------- util DMs ---------- */
+const jumpLink = (guildId, channelId, messageId) =>
+  `https://discord.com/channels/${guildId}/${channelId}/${messageId}`;
+
+const whereStr = (panelMsg, slotTitle) =>
+  `**${slotTitle}** en <#${panelMsg.channelId}>`;
+
+async function dmOnly(i, content, components = []) {
+  // Envía DM y NUNCA responde en el canal (mantener limpio).
+  try { await i.user.send({ content, components }); } catch {}
+  try { await i.deferUpdate(); } catch {}
+}
+
+async function dmUser(userId, payload) {
+  try {
+    const u = await client.users.fetch(userId);
+    await u.send(payload);
+    return true;
+  } catch { return false; }
+}
 
 /* ---------- config ---------- */
 async function loadConfig() {
@@ -95,6 +117,15 @@ const openText    = (title, idx) => `${idx===0 ? '' : GAP_BEFORE}**${title}**`;
 const busyText    = (title, ownerTag, minutes, remMs, idx) => `${idx===0 ? '' : GAP_BEFORE}**${title}** · 🔒 **${ownerTag}** · ⏳ **${mmss(remMs)}** (${minutes}m)`;
 const pendingText = (title, userTag, sec, idx) => `${idx===0 ? '' : GAP_BEFORE}**${title}** · 🟡 pendiente de **${userTag}** · confirma en ${sec}s`;
 
+// Vista de cola (muestra hasta 3)
+function queueLine(panelId){
+  const q = getQueue(panelId);
+  if (!q.length) return '';
+  const names = q.slice(0,3).map(e => `**${e.tag || ('ID:'+e.userId)}** ${e.minutes}m`).join(' · ');
+  const more  = q.length > 3 ? `  +${q.length-3} más` : '';
+  return `\n*📝 Cola:* ${names}${more}`;
+}
+
 function rowFor(idx, minutes, enableDur, enableCancel) {
   const row = new ActionRowBuilder();
   minutes.slice(0,4).forEach((m, i) => {
@@ -121,14 +152,11 @@ function rowPending(idx, panelId, nonce) {
     new ButtonBuilder().setCustomId(`s${idx}_no_${panelId}_${nonce}`).setLabel('Rechazar').setStyle(ButtonStyle.Danger)
   );
 }
-
-// --- Vista de cola (sin ping, muestra hasta 3) ---
-function queueLine(panelId){
-  const q = getQueue(panelId);
-  if (!q.length) return '';
-  const names = q.slice(0,3).map(e => `**${e.tag || ('ID:'+e.userId)}** ${e.minutes}m`).join(' · ');
-  const more  = q.length > 3 ? `  +${q.length-3} más` : '';
-  return `\n*📝 Cola:* ${names}${more}`;
+function dmQueueRow(panelMsg){
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('Ver panel').setURL(jumpLink(panelMsg.guildId, panelMsg.channelId, panelMsg.id)),
+    new ButtonBuilder().setStyle(ButtonStyle.Danger).setLabel('Salir de la cola').setCustomId(`dm_cancel_${panelMsg.id}`)
+  );
 }
 
 async function renderOpen(msg, idx, title, minutes) {
@@ -139,14 +167,12 @@ async function renderBusy(msg, sess) {
   const rem = sess.endAt - Date.now();
   const content = busyText(sess.title, sess.ownerTag, sess.minutesSel, rem, sess.slotIndex) + queueLine(msg.id);
   if (content !== sess.lastText) {
-    // Minutos habilitados para permitir unirse a la cola; Cancelar habilitado para dueño o quien esté en cola.
     await msg.edit({ content, components: [rowFor(sess.slotIndex, sess.minutes, true, true)] });
     sess.lastText = content;
   }
 }
 async function renderPending(msg, idx, title, userTag, sec, panelId, nonce, minutes) {
   const content = pendingText(title, userTag, sec, idx) + queueLine(msg.id);
-  // Fila 1: Confirmar/Rechazar; Fila 2: minutos (cola) + Cancelar activo para permitir salir de cola/pending
   await msg.edit({ content, components: [rowPending(idx, panelId, nonce), rowFor(idx, minutes, true, true)] });
 }
 
@@ -251,6 +277,15 @@ async function promoteNext(panelMsg, slot, idx){
   let userTag = next.tag || `ID:${next.userId}`;
   await renderPending(panelMsg, idx, slot.title, userTag, sec, panelId, nonce, slot.minutes);
 
+  // DM al pendiente con link y botón para salir
+  await dmUser(next.userId, {
+    content:
+      `🔔 Te toca en ${whereStr(panelMsg, slot.title)} por **${next.minutes}m**.\n` +
+      `Tenés **${sec}s** para confirmar en el panel.\n` +
+      `Enlace: ${jumpLink(panelMsg.guildId, panelMsg.channelId, panelMsg.id)}`,
+    components: [dmQueueRow(panelMsg)]
+  });
+
   const timeout = setTimeout(async ()=>{
     const p = pendings.get(panelId);
     if (!p || p.nonce !== nonce) return;
@@ -310,7 +345,48 @@ client.on(Events.MessageDelete, async (msg)=>{
 client.on(Events.InteractionCreate, async i=>{
   if (!i.isButton()) return;
 
-  // 1) Confirmar / Rechazar (sobre el propio panel)
+  // A) Botón DM: “Salir de la cola”
+  {
+    const m = /^dm_cancel_(\d+)$/.exec(i.customId);
+    if (m) {
+      const panelId = m[1];
+      // encontrar chId e idx a partir de anchors
+      let chId = null, idx = null;
+      for (const [k, v] of anchors) {
+        if (v === panelId) { [chId, idx] = k.split(':'); idx = parseInt(idx,10); break; }
+      }
+      if (!chId || Number.isNaN(idx)) { try { await i.reply('⚠️ Ese panel ya no existe.'); } catch {} return; }
+      const ch = await client.channels.fetch(chId).catch(()=>null);
+      if (!ch || ch.type !== ChannelType.GuildText) { try { await i.reply('⚠️ Canal inválido.'); } catch {} return; }
+      const panelMsg = await ch.messages.fetch(panelId).catch(()=>null);
+      if (!panelMsg) { try { await i.reply('⚠️ El panel fue recreado.'); } catch {} return; }
+
+      const plan = planByChannel.get(ch.id);
+      const slot = plan?.[idx];
+      if (!slot) { try { await i.reply('⚠️ Slot inválido.'); } catch {} return; }
+
+      const queue = getQueue(panelId);
+      const pos = inQueue(queue, i.user.id);
+      const pending = pendings.get(panelId);
+
+      if (pending && pending.userId === i.user.id) {
+        clearPending(panelId);
+        await promoteNext(panelMsg, slot, idx);
+        try { await i.reply(`✅ Saliste del turno pendiente de ${whereStr(panelMsg, slot.title)}.`); } catch {}
+        return;
+      }
+      if (pos !== -1) {
+        queue.splice(pos,1);
+        await refreshPanel(panelMsg, idx, slot);
+        try { await i.reply(`✅ Saliste de la sala de espera de ${whereStr(panelMsg, slot.title)}.`); } catch {}
+        return;
+      }
+      try { await i.reply(`ℹ️ No estás en la cola de ${whereStr(panelMsg, slot.title)}.`); } catch {}
+      return;
+    }
+  }
+
+  // B) Confirmar / Rechazar (desde panel o DM)
   {
     const m = /^s(\d+)_(ok|no)_(\d+)_(.+)$/.exec(i.customId);
     if (m) {
@@ -319,19 +395,18 @@ client.on(Events.InteractionCreate, async i=>{
       const panelId = m[3];
       const nonce = m[4];
 
-      if (i.message.id !== panelId) { try { await i.deferUpdate(); } catch {} return; }
+      // buscar el panel real (aceptamos click desde DM)
+      let chId = null;
+      for (const [k, v] of anchors) { if (v === panelId) { [chId] = k.split(':'); break; } }
+      const ch = chId ? await client.channels.fetch(chId).catch(()=>null) : null;
+      const panelMsg = ch ? await ch.messages.fetch(panelId).catch(()=>null) : null;
+      if (!panelMsg) { await dmOnly(i, '⚠️ Este turno ya no está disponible.'); return; }
 
       const pending = pendings.get(panelId);
-      if (!pending || pending.nonce !== nonce) {
-        try { await i.reply({ ephemeral: true, content: '⚠️ Este turno ya no está disponible.' }); } catch {}
-        return;
-      }
-      if (i.user.id !== pending.userId) {
-        try { await i.reply({ ephemeral: true, content: '⛔ Este aviso no es para vos.' }); } catch {}
-        return;
-      }
+      if (!pending || pending.nonce !== nonce) { await dmOnly(i, '⚠️ Este turno ya no está disponible.'); return; }
+      if (i.user.id !== pending.userId) { await dmOnly(i, '⛔ Este aviso no es para vos.'); return; }
 
-      const plan = planByChannel.get(i.channel.id);
+      const plan = planByChannel.get(panelMsg.channel.id);
       if (!plan) { try { await i.deferUpdate(); } catch {} return; }
       const slot = plan[idx];
 
@@ -339,7 +414,7 @@ client.on(Events.InteractionCreate, async i=>{
         clearPending(panelId);
         const minutesSel = pending.minutes;
         const sess = {
-          channel: i.channel, chId: i.channel.id, slotIndex: idx,
+          channel: panelMsg.channel, chId: panelMsg.channel.id, slotIndex: idx,
           title: slot.title, minutes: slot.minutes, minutesSel,
           ownerId: i.user.id, ownerTag: i.user.tag,
           endAt: Date.now() + minutesSel * 60 * 1000,
@@ -347,27 +422,32 @@ client.on(Events.InteractionCreate, async i=>{
         };
         sessions.set(panelId, sess);
 
-        const render = async () => { await renderBusy(i.message, sess).catch(()=>{}); };
+        const render = async () => { await renderBusy(panelMsg, sess).catch(()=>{}); };
         await render();
         sess.timer = setInterval(()=>render().catch(()=>{}), UPDATE_STEP_MS);
 
         setTimeout(async ()=>{
           clearInterval(sess.timer);
           sessions.delete(panelId);
-          await promoteNext(i.message, slot, idx);
+          await promoteNext(panelMsg, slot, idx);
+          await dmUser(i.user.id, { content: `⏱️ Tu tiempo en ${whereStr(panelMsg, slot.title)} terminó.` });
         }, minutesSel * 60 * 1000);
 
-        try { await i.reply({ ephemeral: true, content: `✅ Confirmado. Tenés **${minutesSel}m**.` }); } catch {}
+        await dmOnly(
+          i,
+          `✅ Confirmado: **${minutesSel}m** en ${whereStr(panelMsg, slot.title)}.\n` +
+          `Panel: ${jumpLink(panelMsg.guildId, panelMsg.channelId, panelMsg.id)}`
+        );
       } else {
         clearPending(panelId);
-        await promoteNext(i.message, slot, idx);
-        try { await i.reply({ ephemeral: true, content: 'Hecho. Saliste del turno.' }); } catch {}
+        await promoteNext(panelMsg, slot, idx);
+        await dmOnly(i, `❎ Rechazaste el turno en ${whereStr(panelMsg, slot.title)}.`);
       }
       return;
     }
   }
 
-  // 2) Panel principal (minutos / cancelar)
+  // C) Panel principal (minutos / cancelar) — SOLO en canal de guild
   const ch = i.channel;
   if (!ch || ch.type !== ChannelType.GuildText) return;
 
@@ -392,31 +472,28 @@ client.on(Events.InteractionCreate, async i=>{
     const sess = sessions.get(panelId);
     const queue = getQueue(panelId);
     const pos = inQueue(queue, i.user.id);
+    const pending = pendings.get(panelId);
 
-    // cancelar activo (sólo dueño)
     if (sess && i.user.id === sess.ownerId) {
       clearInterval(sess.timer);
       sessions.delete(panelId);
       await promoteNext(panelMsg, slot, idx);
-      try { await i.deferUpdate(); } catch {}
+      await dmOnly(i, `🛑 Cancelaste tu tiempo en ${whereStr(panelMsg, slot.title)}.`);
       return;
     }
-    // cancelar pendiente
-    const pending = pendings.get(panelId);
     if (pending && pending.userId === i.user.id) {
       clearPending(panelId);
       await promoteNext(panelMsg, slot, idx);
-      try { await i.reply({ ephemeral: true, content: '✅ Cancelaste tu turno pendiente.' }); } catch {}
+      await dmOnly(i, `✅ Cancelaste tu turno pendiente en ${whereStr(panelMsg, slot.title)}.`);
       return;
     }
-    // cancelar posición en cola
     if (pos !== -1) {
       queue.splice(pos, 1);
       await refreshPanel(panelMsg, idx, slot);
-      try { await i.reply({ ephemeral: true, content: '✅ Saliste de la sala de espera.' }); } catch {}
+      await dmOnly(i, `✅ Saliste de la sala de espera de ${whereStr(panelMsg, slot.title)}.`);
       return;
     }
-    try { await i.reply({ ephemeral: true, content: '⚠️ No tenés nada para cancelar en este slot.' }); } catch {}
+    await dmOnly(i, `⚠️ No tenés nada para cancelar en ${whereStr(panelMsg, slot.title)}.`);
     return;
   }
 
@@ -431,7 +508,11 @@ client.on(Events.InteractionCreate, async i=>{
   const alreadyInQueue = inQueue(queue, i.user.id) !== -1;
 
   if (alreadyActive || alreadyPending || alreadyInQueue) {
-    try { await i.reply({ ephemeral: true, content: '⚠️ Ya estás participando de este slot.' }); } catch {}
+    await dmOnly(
+      i,
+      `⚠️ Ya estás participando de ${whereStr(panelMsg, slot.title)}.\n` +
+      `Panel: ${jumpLink(panelMsg.guildId, panelMsg.channelId, panelMsg.id)}`
+    );
     return;
   }
 
@@ -454,20 +535,36 @@ client.on(Events.InteractionCreate, async i=>{
       clearInterval(sess.timer);
       sessions.delete(panelId);
       await promoteNext(panelMsg, slot, idx);
+      await dmUser(i.user.id, { content: `⏱️ Tu tiempo en ${whereStr(panelMsg, slot.title)} terminó.` });
     }, minutesSel*60*1000);
 
-    try { await i.deferUpdate(); } catch {}
+    await dmOnly(
+      i,
+      `✅ Empezaste **${minutesSel}m** en ${whereStr(panelMsg, slot.title)}.\n` +
+      `Panel: ${jumpLink(panelMsg.guildId, panelMsg.channelId, panelMsg.id)}`
+    );
     return;
   }
 
   // si está ocupado o hay pendiente -> cola
   if (queue.length >= QUEUE_CAPACITY) {
-    try { await i.reply({ ephemeral: true, content: `⛔ La sala de espera está llena (capacidad ${QUEUE_CAPACITY}).` }); } catch {}
+    await dmOnly(
+      i,
+      `⛔ La sala de espera de ${whereStr(panelMsg, slot.title)} está llena (capacidad ${QUEUE_CAPACITY}).\n` +
+      `Panel: ${jumpLink(panelMsg.guildId, panelMsg.channelId, panelMsg.id)}`
+    );
     return;
   }
   queue.push({ userId: i.user.id, minutes: minutesSel, enqueuedAt: Date.now(), tag: i.user.tag });
   await refreshPanel(panelMsg, idx, slot);
-  try { await i.reply({ ephemeral: true, content: `🕒 Entraste en la sala de espera. Posición: **${queue.length}**.` }); } catch {}
+
+  await dmOnly(
+    i,
+    `🕒 Entraste a la sala de espera de ${whereStr(panelMsg, slot.title)} por **${minutesSel}m**.\n` +
+    `Posición actual: **${queue.length}**.\n` +
+    `Panel: ${jumpLink(panelMsg.guildId, panelMsg.channelId, panelMsg.id)}`,
+    [dmQueueRow(panelMsg)]
+  );
 });
 
 /* ---------- manejo de señales (limpio) ---------- */
