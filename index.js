@@ -3,6 +3,7 @@
 // - DMs con link "Ver panel" y "Salir de la cola"
 // - Cooldown configurable por cancelación (CANCEL_COOLDOWN_SEC o _MIN)
 // - BLOQUEO GLOBAL: un usuario no puede estar activo/pendiente/en cola en más de un slot a la vez
+// - Fix: al cancelar o recrear panel, no envía el DM de “tu tiempo terminó” (limpia interval/timeout)
 
 import {
   Client, GatewayIntentBits, Events,
@@ -35,6 +36,7 @@ const sleep = (ms) => new Promise(r => setTimeout(r, 350));
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
+console.log(`⚙️ Cooldown: ${COOLDOWN_LABEL} (${COOLDOWN_MS}ms) usando ${process.env.CANCEL_COOLDOWN_SEC ? 'SEC' : 'MIN'}`);
 
 /* ---------- util DMs ---------- */
 const jumpLink = (guildId, channelId, messageId) =>
@@ -255,6 +257,15 @@ async function refreshPanel(panelMsg, idx, slot){
   } else await renderOpen(panelMsg, idx, slot.title, slot.minutes);
 }
 
+/* ---------- limpiar sesiones / timers ---------- */
+function stopSessionById(panelId){
+  const s = sessions.get(panelId);
+  if (!s) return;
+  try { clearInterval(s.timer); } catch {}
+  try { clearTimeout(s.endTO); } catch {}
+  sessions.delete(panelId);
+}
+
 /* ---------- limpieza ---------- */
 async function purgeChannel(ch){
   try{
@@ -296,7 +307,11 @@ async function resolveChannels(guild, cfg){
 async function createPanelsForChannel(ch, slots){
   await purgeChannel(ch);
   planByChannel.set(ch.id, slots);
-  for (const [panelId, sess] of sessions) if (sess.chId === ch.id) sessions.delete(panelId);
+
+  // Apagar sesiones y limpiar estados del canal
+  for (const [panelId, sess] of sessions) {
+    if (sess.chId === ch.id) stopSessionById(panelId);
+  }
   for (const [panelId] of waitlists) {
     const ok = await ch.messages.fetch(panelId).then(()=>true).catch(()=>false);
     if (!ok) waitlists.delete(panelId);
@@ -305,7 +320,11 @@ async function createPanelsForChannel(ch, slots){
     const ok = await ch.messages.fetch(panelId).then(()=>true).catch(()=>false);
     if (!ok) { if (p.timeout) clearTimeout(p.timeout); pendings.delete(panelId); }
   }
+
+  // Reset de anclas
   for (let i=0;i<slots.length+10;i++) anchors.delete(keyFor(ch.id, i));
+
+  // Crear paneles
   for (let i=0;i<slots.length;i++){
     const msg = await ch.send({ content: '‎' });
     anchors.set(keyFor(ch.id,i), msg.id);
@@ -405,11 +424,14 @@ client.on(Events.MessageDelete, async (msg)=>{
     for (let i=0;i<plan.length;i++){
       const k = keyFor(msg.channel.id, i);
       if (anchors.get(k) === msg.id){
+        // limpiar el panel BORRADO (msg.id), no el nuevo
+        stopSessionById(msg.id);
+        waitlists.delete(msg.id);
+        clearPending(msg.id);
+
+        // crear ancla nueva
         const m = await msg.channel.send({ content: '‎' });
         anchors.set(k, m.id);
-        sessions.delete(m.id);
-        waitlists.delete(m.id);
-        clearPending(m.id);
         await renderOpen(m, i, plan[i].title, plan[i].minutes);
         break;
       }
@@ -512,9 +534,8 @@ client.on(Events.InteractionCreate, async i=>{
         await render();
         sess.timer = setInterval(()=>render().catch(()=>{}), UPDATE_STEP_MS);
 
-        setTimeout(async ()=>{
-          clearInterval(sess.timer);
-          sessions.delete(panelId);
+        sess.endTO = setTimeout(async ()=>{
+          stopSessionById(panelId);
           await promoteNext(panelMsg, slot, idx);
           await dmUser(i.user.id, { content: `⏱️ Tu tiempo en ${whereStr(panelMsg, slot.title)} terminó.` });
         }, minutesSel * 60 * 1000);
@@ -555,12 +576,11 @@ client.on(Events.InteractionCreate, async i=>{
     const pos = inQueue(queue, i.user.id);
     const pending = pendings.get(panelId);
 
-    // cancelar activo (APLICA COOLDOWN)
+    // cancelar activo (APLICA COOLDOWN + limpia interval/timeout)
     if (sess && i.user.id === sess.ownerId) {
-      clearInterval(sess.timer);
-      sessions.delete(panelId);
-      applyCooldown(ch.id, idx, i.user.id);
+      stopSessionById(panelId);
       await promoteNext(panelMsg, slot, idx);
+      applyCooldown(ch.id, idx, i.user.id);
       await dmOnly(i, `🛑 Cancelaste tu tiempo en ${whereStr(panelMsg, slot.title)}.\nQuedás en **cooldown ${COOLDOWN_LABEL}** para este slot.`);
       return;
     }
@@ -630,9 +650,8 @@ client.on(Events.InteractionCreate, async i=>{
     await render();
     sess.timer = setInterval(()=>render().catch(()=>{}), UPDATE_STEP_MS);
 
-    setTimeout(async ()=>{
-      clearInterval(sess.timer);
-      sessions.delete(panelId);
+    sess.endTO = setTimeout(async ()=>{
+      stopSessionById(panelId);
       await promoteNext(panelMsg, slot, idx);
       await dmUser(i.user.id, { content: `⏱️ Tu tiempo en ${whereStr(panelMsg, slot.title)} terminó.` });
     }, minutesSel*60*1000);
