@@ -39,8 +39,7 @@
 
     { "names": ["piedra-p6", "piedra-p7", "piedra-p8", "piedra-p9"], "profile": "dosbot" }
   ],
-
-  /* >>> Claves nuevas para la sala de espera y confirmación <<< */
+  
   "queueCapacity": 2,
   "confirmWindowSec": 45,
   "notifyChannelId": "ID_DEL_CANAL"
