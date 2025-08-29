@@ -1,7 +1,6 @@
-// index.js — Multi-salas con perfiles (claim.config.json o ENV)
-// Texto sin embeds, limpia canal al iniciar, paneles fijos (título + botones),
-// botón Cancelar, contador con throttle (CLAIM_UPDATE_MS), 2 espacios entre bloques.
-// + Sala de espera por slot (QUEUE_CAPACITY) y confirmación (CONFIRM_WINDOW_SEC)
+// index.js — Multi-salas (perfiles desde CLAIM_CONFIG o CLAIM_CONFIG_FILE en ENV)
+// Paneles sin embeds, sin mensajes “abajo”, botón Cancelar, contador (CLAIM_UPDATE_MS).
+// Sala de espera por slot (QUEUE_CAPACITY) + confirmación integrada (CONFIRM_WINDOW_SEC).
 
 import {
   Client, GatewayIntentBits, Events,
@@ -12,9 +11,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 /* ---------- ajustes por ENV (Koyeb) ---------- */
-const UPDATE_STEP_MS = Math.max(1000, parseInt(process.env.CLAIM_UPDATE_MS || '30000', 10));
-const QUEUE_CAPACITY = Math.max(0, parseInt(process.env.QUEUE_CAPACITY || '2', 10));
-const CONFIRM_WINDOW_SEC = Math.max(5, parseInt(process.env.CONFIRM_WINDOW_SEC || '45', 10));
+const UPDATE_STEP_MS     = Math.max(1000, parseInt(process.env.CLAIM_UPDATE_MS || '30000', 10));
+const QUEUE_CAPACITY     = Math.max(0,   parseInt(process.env.QUEUE_CAPACITY || '2', 10));
+const CONFIRM_WINDOW_SEC = Math.max(5,   parseInt(process.env.CONFIRM_WINDOW_SEC || '45', 10));
 
 const TWO_WEEKS = 14 * 24 * 60 * 60 * 1000;
 const PURGE_LOOP_MAX = 50;
@@ -27,7 +26,6 @@ const client = new Client({
 
 /* ---------- config ---------- */
 async function loadConfig() {
-  // Preferencia: CLAIM_CONFIG_FILE (ruta) > CLAIM_CONFIG (JSON string) > default
   const file = process.env.CLAIM_CONFIG_FILE;
   if (file) {
     const p = path.resolve(process.cwd(), file);
@@ -37,7 +35,7 @@ async function loadConfig() {
   if (process.env.CLAIM_CONFIG) {
     return normalizeConfig(JSON.parse(process.env.CLAIM_CONFIG));
   }
-  // default mínimo (si no pasaste nada por ENV)
+  // default mínimo
   return normalizeConfig({
     profiles: {
       pico: {
@@ -68,34 +66,34 @@ function normalizeConfig(cfg) {
   }
   const out = [];
   for (const c of cfg.channels || []) {
-    const ids = Array.isArray(c.ids) ? c.ids : (c.id ? [c.id] : []);
+    const ids   = Array.isArray(c.ids)   ? c.ids   : (c.id   ? [c.id]   : []);
     const names = Array.isArray(c.names) ? c.names : (c.name ? [c.name] : []);
     const slots = c.slots ? normSlots(c.slots)
-                : (c.profile && profiles[c.profile]) ? profiles[c.profile]
-                : null;
+      : (c.profile && profiles[c.profile]) ? profiles[c.profile]
+      : null;
     if (!slots || !slots.length) continue;
-    ids.forEach(id => out.push({ id: String(id), slots }));
-    names.forEach(nm => out.push({ name: String(nm).toLowerCase(), slots }));
+    ids.forEach(id  => out.push({ id: String(id), slots }));
+    names.forEach(n => out.push({ name: String(n).toLowerCase(), slots }));
     if (!ids.length && !names.length && c.profile) out.push({ name: 'claimed-pico', slots });
   }
   return { channels: out };
 }
 
 /* ---------- estado ---------- */
-const anchors = new Map();        // `${channelId}:${idx}` -> panelMessageId (ancla)
-const planByChannel = new Map();  // channelId -> [{title, minutes}, ...]
-const sessions = new Map();       // panelMessageId -> sess (activo)
-const waitlists = new Map();      // panelMessageId -> [{ userId, minutes, enqueuedAt }]
-const pendings = new Map();       // panelMessageId -> { userId, minutes, confirmMsgId, deadline, timeout, nonce }
+const anchors      = new Map();  // `${channelId}:${idx}` -> panelMessageId
+const planByChannel= new Map();  // channelId -> [{title, minutes}, ...]
+const sessions     = new Map();  // panelMessageId -> { ownerId, ... }
+const waitlists    = new Map();  // panelMessageId -> [{ userId, minutes, enqueuedAt }]
+const pendings     = new Map();  // panelMessageId -> { userId, minutes, deadline, timeout, nonce, userTag }
 
 const keyFor = (chId, idx) => `${chId}:${idx}`;
-const GAP_BEFORE = `\n\u200B\n\u200B`; // 2 espacios visuales
+const GAP_BEFORE = `\n\u200B\n\u200B`;
 
 /* ---------- UI ---------- */
 function mmss(ms){ if(ms<0) ms=0; const s=Math.floor(ms/1000), m=Math.floor(s/60), ss=s%60; return `${m<10?'0':''}${m}:${ss<10?'0':''}${ss}`; }
-const openText = (title, idx) => `${idx===0 ? '' : GAP_BEFORE}**${title}**`;
-const busyText = (title, ownerTag, minutes, remMs, idx) =>
-  `${idx===0 ? '' : GAP_BEFORE}**${title}** · 🔒 **${ownerTag}** · ⏳ **${mmss(remMs)}** (${minutes}m)`;
+const openText  = (title, idx) => `${idx===0 ? '' : GAP_BEFORE}**${title}**`;
+const busyText  = (title, ownerTag, minutes, remMs, idx) => `${idx===0 ? '' : GAP_BEFORE}**${title}** · 🔒 **${ownerTag}** · ⏳ **${mmss(remMs)}** (${minutes}m)`;
+const pendingText = (title, userTag, sec, idx) => `${idx===0 ? '' : GAP_BEFORE}**${title}** · 🟡 pendiente de **${userTag}** · confirma en ${sec}s`;
 
 function rowFor(idx, minutes, enableDur, enableCancel) {
   const row = new ActionRowBuilder();
@@ -117,6 +115,12 @@ function rowFor(idx, minutes, enableDur, enableCancel) {
   );
   return row;
 }
+function rowPending(idx, panelId, nonce) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`s${idx}_ok_${panelId}_${nonce}`).setLabel('Confirmar').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`s${idx}_no_${panelId}_${nonce}`).setLabel('Rechazar').setStyle(ButtonStyle.Danger)
+  );
+}
 async function renderOpen(msg, idx, title, minutes) {
   await msg.edit({ content: openText(title, idx), components: [rowFor(idx, minutes, true, false)] });
 }
@@ -128,15 +132,14 @@ async function renderBusy(msg, sess) {
     sess.lastText = text;
   }
 }
+async function renderPending(msg, idx, title, userTag, sec, panelId, nonce) {
+  await msg.edit({ content: pendingText(title, userTag, sec, idx), components: [rowPending(idx, panelId, nonce)] });
+}
 
 /* ---------- helpers de cola ---------- */
 function getQueue(panelId){ if (!waitlists.has(panelId)) waitlists.set(panelId, []); return waitlists.get(panelId); }
 function inQueue(queue, userId){ return queue.findIndex(q => q.userId === userId); }
-function clearPending(panelId) {
-  const p = pendings.get(panelId);
-  if (p?.timeout) clearTimeout(p.timeout);
-  pendings.delete(panelId);
-}
+function clearPending(panelId) { const p = pendings.get(panelId); if (p?.timeout) clearTimeout(p.timeout); pendings.delete(panelId); }
 
 /* ---------- limpieza ---------- */
 async function purgeChannel(ch){
@@ -179,63 +182,63 @@ async function resolveChannels(guild, cfg){
 async function createPanelsForChannel(ch, slots){
   await purgeChannel(ch);
   planByChannel.set(ch.id, slots);
-  for (let i=0;i<slots.length;i++) anchors.delete(keyFor(ch.id,i));
+
+  // limpiar estados del canal
+  for (const [panelId, sess] of sessions) if (sess.chId === ch.id) sessions.delete(panelId);
+  for (const [panelId, q] of waitlists) {
+    // si el mensaje no existe o pertenece al mismo canal, limpiamos
+    const ok = await ch.messages.fetch(panelId).then(()=>true).catch(()=>false);
+    if (!ok) waitlists.delete(panelId);
+  }
+  for (const [panelId, p] of pendings) {
+    const ok = await ch.messages.fetch(panelId).then(()=>true).catch(()=>false);
+    if (!ok) { if (p.timeout) clearTimeout(p.timeout); pendings.delete(panelId); }
+  }
+  // borrar anclas previas del canal
+  for (let i=0;i<slots.length+10;i++) anchors.delete(keyFor(ch.id, i));
+
+  // crear anclas nuevas
   for (let i=0;i<slots.length;i++){
     const msg = await ch.send({ content: '‎' }); // ancla
     anchors.set(keyFor(ch.id,i), msg.id);
-    // reset estado
-    sessions.delete(msg.id);
-    waitlists.delete(msg.id);
-    clearPending(msg.id);
     await renderOpen(msg, i, slots[i].title, slots[i].minutes);
   }
 }
 
-/* ---------- promoción / confirmación ---------- */
+/* ---------- promoción / confirmación (integrada al panel, sin mensajes) ---------- */
 async function promoteNext(panelMsg, slot, idx){
   const panelId = panelMsg.id;
-  const ch = panelMsg.channel;
   const queue = getQueue(panelId);
 
   if (pendings.has(panelId) || sessions.has(panelId)) return;
 
   if (queue.length === 0) {
     await renderOpen(panelMsg, idx, slot.title, slot.minutes).catch(()=>{});
-    try { await ch.send(`🟢 **${slot.title}** quedó libre.`); } catch {}
     return;
   }
 
-  const next = queue.shift();
+  const next  = queue.shift();
   const nonce = Math.random().toString(36).slice(2,10) + Date.now().toString(36);
-  const sec = CONFIRM_WINDOW_SEC;
+  const sec   = CONFIRM_WINDOW_SEC;
 
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`s${idx}_ok_${panelId}_${nonce}`).setLabel('Confirmar').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId(`s${idx}_no_${panelId}_${nonce}`).setLabel('Rechazar').setStyle(ButtonStyle.Danger)
-  );
+  // Mostrar tag (sin ping)
+  let userTag = `ID:${next.userId}`;
+  try { const u = await client.users.fetch(next.userId); if (u?.tag) userTag = u.tag; } catch {}
 
-  let confirmMsg = null;
-  try {
-    confirmMsg = await ch.send({
-      content: `🔔 <@${next.userId}>, es tu turno en **${slot.title}** por **${next.minutes}m**.\nTenés **${sec}s** para confirmar, o perdés el turno.`,
-      components: [row]
-    });
-  } catch {}
+  await renderPending(panelMsg, idx, slot.title, userTag, sec, panelId, nonce);
 
   const timeout = setTimeout(async ()=>{
     const p = pendings.get(panelId);
     if (!p || p.nonce !== nonce) return;
     clearPending(panelId);
-    try { await confirmMsg?.edit({ components: [] }); } catch {}
-    try { await ch.send(`⌛ <@${next.userId}> no confirmó a tiempo en **${slot.title}**. Pasando al siguiente…`); } catch {}
-    await promoteNext(panelMsg, slot, idx);
+    await promoteNext(panelMsg, slot, idx); // siguiente o queda abierto
   }, sec * 1000);
 
   pendings.set(panelId, {
-    userId: next.userId, minutes: next.minutes,
-    confirmMsgId: confirmMsg?.id || null,
+    userId: next.userId,
+    minutes: next.minutes,
     deadline: Date.now() + sec*1000,
-    timeout, nonce
+    timeout, nonce, userTag
   });
 }
 
@@ -248,7 +251,7 @@ client.once(Events.ClientReady, async (c)=>{
     const channels = await resolveChannels(g, cfg);
     for (const { ch, slots } of channels) await createPanelsForChannel(ch, slots);
   }
-  // watchdog simple por si cambiás canales en ENV/archivo mientras corre
+  // watchdog (agrega paneles nuevos si aparecen en config)
   setInterval(async ()=>{
     const cfg2 = await loadConfig();
     for (const [,g] of c.guilds.cache) {
@@ -260,7 +263,7 @@ client.once(Events.ClientReady, async (c)=>{
   }, 120000);
 });
 
-/* ---------- borrar panel -> recrear ---------- */
+/* ---------- si borran un panel, recrearlo ---------- */
 client.on(Events.MessageDelete, async (msg)=>{
   try{
     const plan = planByChannel.get(msg?.channel?.id);
@@ -284,7 +287,7 @@ client.on(Events.MessageDelete, async (msg)=>{
 client.on(Events.InteractionCreate, async i=>{
   if (!i.isButton()) return;
 
-  // 1) Confirm/Decline (mensaje aparte)
+  // 1) Confirmar / Rechazar (sobre el propio panel)
   {
     const m = /^s(\d+)_(ok|no)_(\d+)_(.+)$/.exec(i.customId);
     if (m) {
@@ -292,6 +295,9 @@ client.on(Events.InteractionCreate, async i=>{
       const kind = m[2];
       const panelId = m[3];
       const nonce = m[4];
+
+      // el click debe ser en el mismo panel
+      if (i.message.id !== panelId) { try { await i.deferUpdate(); } catch {} return; }
 
       const pending = pendings.get(panelId);
       if (!pending || pending.nonce !== nonce) {
@@ -303,21 +309,15 @@ client.on(Events.InteractionCreate, async i=>{
         return;
       }
 
-      const panelMsg = await i.channel.messages.fetch(panelId).catch(()=>null);
-      const ch = i.channel;
-      if (!panelMsg) { try { await i.deferUpdate(); } catch{} return; }
-
-      try { await i.message.edit({ components: [] }); } catch {}
-
-      const plan = planByChannel.get(panelMsg.channel.id);
-      if (!plan) { try { await i.deferUpdate(); } catch{} return; }
+      const plan = planByChannel.get(i.channel.id);
+      if (!plan) { try { await i.deferUpdate(); } catch {} return; }
       const slot = plan[idx];
 
       if (kind === 'ok') {
         clearPending(panelId);
         const minutesSel = pending.minutes;
         const sess = {
-          channel: panelMsg.channel, chId: panelMsg.channel.id, slotIndex: idx,
+          channel: i.channel, chId: i.channel.id, slotIndex: idx,
           title: slot.title, minutes: slot.minutes, minutesSel,
           ownerId: i.user.id, ownerTag: i.user.tag,
           endAt: Date.now() + minutesSel * 60 * 1000,
@@ -325,23 +325,20 @@ client.on(Events.InteractionCreate, async i=>{
         };
         sessions.set(panelId, sess);
 
-        const render = async () => { await renderBusy(panelMsg, sess).catch(()=>{}); };
+        const render = async () => { await renderBusy(i.message, sess).catch(()=>{}); };
         await render();
         sess.timer = setInterval(()=>render().catch(()=>{}), UPDATE_STEP_MS);
 
         setTimeout(async ()=>{
           clearInterval(sess.timer);
           sessions.delete(panelId);
-          try { await ch.send(`⏱️ Se terminó el tiempo de <@${sess.ownerId}> en **${slot.title}**.`); } catch {}
-          await promoteNext(panelMsg, slot, idx);
+          await promoteNext(i.message, slot, idx);
         }, minutesSel * 60 * 1000);
 
         try { await i.reply({ ephemeral: true, content: `✅ Confirmado. Tenés **${minutesSel}m**.` }); } catch {}
       } else {
-        const who = pending.userId;
         clearPending(panelId);
-        try { await ch.send(`❎ <@${who}> rechazó su turno en **${slot.title}**. Pasando al siguiente…`); } catch {}
-        await promoteNext(panelMsg, slot, idx);
+        await promoteNext(i.message, slot, idx);
         try { await i.reply({ ephemeral: true, content: 'Hecho. Saliste del turno.' }); } catch {}
       }
       return;
@@ -374,14 +371,23 @@ client.on(Events.InteractionCreate, async i=>{
     const queue = getQueue(panelId);
     const pos = inQueue(queue, i.user.id);
 
+    // cancelar activo (sólo dueño)
     if (sess && i.user.id === sess.ownerId) {
       clearInterval(sess.timer);
       sessions.delete(panelId);
-      try { await i.deferUpdate(); } catch {}
-      try { await ch.send(`🛑 <@${sess.ownerId}> canceló su tiempo en **${slot.title}**.`); } catch {}
       await promoteNext(panelMsg, slot, idx);
+      try { await i.deferUpdate(); } catch {}
       return;
     }
+    // cancelar pendiente
+    const pending = pendings.get(panelId);
+    if (pending && pending.userId === i.user.id) {
+      clearPending(panelId);
+      await promoteNext(panelMsg, slot, idx);
+      try { await i.reply({ ephemeral: true, content: '✅ Cancelaste tu turno pendiente.' }); } catch {}
+      return;
+    }
+    // cancelar posición en cola
     if (pos !== -1) {
       queue.splice(pos, 1);
       try { await i.reply({ ephemeral: true, content: '✅ Saliste de la sala de espera.' }); } catch {}
@@ -397,7 +403,7 @@ client.on(Events.InteractionCreate, async i=>{
   if (!minutesList.includes(minutesSel)) { try { await i.deferUpdate(); } catch{} return; }
 
   const queue = getQueue(panelId);
-  const alreadyActive = sessions.get(panelId)?.ownerId === i.user.id;
+  const alreadyActive  = sessions.get(panelId)?.ownerId === i.user.id;
   const alreadyPending = pendings.get(panelId)?.userId === i.user.id;
   const alreadyInQueue = inQueue(queue, i.user.id) !== -1;
 
@@ -406,8 +412,8 @@ client.on(Events.InteractionCreate, async i=>{
     return;
   }
 
+  // si está libre y sin pendiente, activar directo
   if (!sessions.has(panelId) && !pendings.has(panelId)) {
-    try { await i.deferUpdate(); } catch {}
     const sess = {
       channel: ch, chId: ch.id, slotIndex: idx,
       title: slot.title, minutes: minutesList, minutesSel,
@@ -424,13 +430,14 @@ client.on(Events.InteractionCreate, async i=>{
     setTimeout(async ()=>{
       clearInterval(sess.timer);
       sessions.delete(panelId);
-      try { await ch.send(`⏱️ Se terminó el tiempo de <@${sess.ownerId}> en **${slot.title}**.`); } catch {}
       await promoteNext(panelMsg, slot, idx);
     }, minutesSel*60*1000);
 
+    try { await i.deferUpdate(); } catch {}
     return;
   }
 
+  // si está ocupado o hay pendiente -> cola
   if (queue.length >= QUEUE_CAPACITY) {
     try { await i.reply({ ephemeral: true, content: `⛔ La sala de espera está llena (capacidad ${QUEUE_CAPACITY}).` }); } catch {}
     return;
